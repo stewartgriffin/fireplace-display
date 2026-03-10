@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 #include <time.h>
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
@@ -15,6 +16,7 @@
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_cache.h"
 #include "comm.h"
+#include "touch.h"
 
 static const char *TAG = "fireplace";
 
@@ -41,6 +43,17 @@ static const char *TAG = "fireplace";
 #define LCD_BL_LEDC_FREQ_HZ     5000
 
 static esp_lcd_panel_handle_t s_panel = NULL;
+
+static esp_err_t display_set_brightness(int percent);  /* forward declaration */
+
+static void on_touch(uint16_t x, uint16_t y)
+{
+    static bool backlight_on = true;
+    backlight_on = !backlight_on;
+    display_set_brightness(backlight_on ? 100 : 0);
+    ESP_LOGI(TAG, "Touch x=%" PRIu16 " y=%" PRIu16 " → backlight %s",
+             x, y, backlight_on ? "on" : "off");
+}
 
 static void on_time_received(const struct tm *t)
 {
@@ -229,6 +242,7 @@ extern const uint8_t fireplace_bin_end[]   asm("_binary_fireplace_bin_end");
 void app_main(void)
 {
     ESP_ERROR_CHECK(comm_init(on_time_received));
+    ESP_ERROR_CHECK(touch_init(on_touch));
     ESP_ERROR_CHECK(display_backlight_init());
     ESP_ERROR_CHECK(display_init());
 

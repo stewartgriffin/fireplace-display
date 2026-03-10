@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"

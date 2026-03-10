@@ -9,7 +9,11 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:api.github.com)",
       "WebFetch(domain:spotpear.com)",
-      "WebFetch(domain:files.waveshare.com)"
+      "WebFetch(domain:files.waveshare.com)",
+      "WebFetch(domain:community.platformio.org)",
+      "WebFetch(domain:www.waveshare.net)",
+      "WebFetch(domain:esphome.io)",
+      "Bash(grep -v \"^$\")"
     ]
   }
 }

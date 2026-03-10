@@ -11,6 +11,16 @@
 |----------------|-------------|
 | LCD Backlight  | GPIO_NUM_26 |
 | LCD Reset      | GPIO_NUM_27 |
+| Touch I2C SDA  | GPIO_NUM_7  |
+| Touch I2C SCL  | GPIO_NUM_8  |
+| Touch RST      | GPIO_NUM_23 |
+| Touch INT      | NC          |
+
+## Touch Controller
+- **Chip**: GT911 (Goodix capacitive, I2C address 0x5D)
+- **Driver component**: `espressif/esp_lcd_touch_gt911`
+- **I2C frequency**: 400 kHz on I2C_NUM_0
+- **API**: `touch_init(callback)` in `main/touch.c` — polls every 10 ms, calls callback with (x, y)
 
 ## Display Interface
 - **Protocol**: MIPI DSI, 2 lanes, 480 Mbps lane bit rate
