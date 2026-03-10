@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(md5 /Users/tomaszziajko/code/fireplace-display/fireplace.png /Users/tomaszziajko/code/fireplace-display/main/fireplace.bin)"
+    ]
+  }
+}
