@@ -1,2 +1,1 @@
-dependencies:
-  espressif/esp_lcd_touch_gt911: ">=1.0.0"
+## IDF Component Manager Manifest File

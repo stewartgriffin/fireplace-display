@@ -1,3 +1,3 @@
-idf_component_register(SRCS "main.c" "comm.c" "touch.c"
+idf_component_register(SRCS "main.c" "comm.c" "touch.c" "gui.c"
                     INCLUDE_DIRS "."
                     EMBED_FILES "fireplace.bin")

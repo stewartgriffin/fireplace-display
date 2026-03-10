@@ -17,6 +17,7 @@
 #include "esp_cache.h"
 #include "comm.h"
 #include "touch.h"
+#include "gui.h"
 
 static const char *TAG = "fireplace";
 
@@ -46,13 +47,15 @@ static esp_lcd_panel_handle_t s_panel = NULL;
 
 static esp_err_t display_set_brightness(int percent);  /* forward declaration */
 
-static void on_touch(uint16_t x, uint16_t y)
+/* Button actions */
+static void action_light_up(void)
 {
-    static bool backlight_on = true;
-    backlight_on = !backlight_on;
-    display_set_brightness(backlight_on ? 100 : 0);
-    ESP_LOGI(TAG, "Touch x=%" PRIu16 " y=%" PRIu16 " → backlight %s",
-             x, y, backlight_on ? "on" : "off");
+    ESP_LOGI(TAG, "*** BUTTON PRESSED: Light Up (orange) ***");
+}
+
+static void action_extinguish(void)
+{
+    ESP_LOGI(TAG, "*** BUTTON PRESSED: Extinguish (blue) ***");
 }
 
 static void on_time_received(const struct tm *t)
@@ -242,7 +245,6 @@ extern const uint8_t fireplace_bin_end[]   asm("_binary_fireplace_bin_end");
 void app_main(void)
 {
     ESP_ERROR_CHECK(comm_init(on_time_received));
-    ESP_ERROR_CHECK(touch_init(on_touch));
     ESP_ERROR_CHECK(display_backlight_init());
     ESP_ERROR_CHECK(display_init());
 
@@ -252,6 +254,29 @@ void app_main(void)
     size_t fb_size = LCD_H_RES * LCD_V_RES * sizeof(uint16_t);
     memcpy(fb, fireplace_bin_start, fb_size);
     esp_cache_msync(fb, fb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    /* Initialise GUI and register buttons */
+    gui_init((uint16_t *)fb, LCD_H_RES, LCD_V_RES);
+
+    /* Orange "light up" button: user coords BL(49,546) TR(357,651)
+     * screen coords (y = 720 - y_user): x=49, y=69, w=308, h=105 */
+    const gui_button_t btn_light = {
+        .x = 49, .y = 69, .w = 308, .h = 105,
+        .pressed_img = NULL,
+        .on_press = action_light_up,
+    };
+    gui_register_button(&btn_light);
+
+    /* Blue "extinguish" button: user coords BL(364,546) TR(667,651)
+     * screen coords: x=364, y=69, w=303, h=105 */
+    const gui_button_t btn_ext = {
+        .x = 364, .y = 69, .w = 303, .h = 105,
+        .pressed_img = NULL,
+        .on_press = action_extinguish,
+    };
+    gui_register_button(&btn_ext);
+
+    ESP_ERROR_CHECK(touch_init(gui_handle_touch));
 
     /* Turn on backlight at full brightness */
     ESP_ERROR_CHECK(display_set_brightness(100));
