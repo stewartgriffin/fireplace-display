@@ -17,7 +17,7 @@ static const char *TAG = "comm";
 #define COMM_UART_NUM       UART_NUM_1
 #define COMM_TX_PIN         GPIO_NUM_47
 #define COMM_RX_PIN         GPIO_NUM_48
-#define COMM_BAUD_RATE      9600
+#define COMM_BAUD_RATE      115200
 
 /* ---------- Protocol constants ---------- */
 #define COMM_SOF            0xAA
