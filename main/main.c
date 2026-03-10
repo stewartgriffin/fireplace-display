@@ -15,6 +15,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_cache.h"
+#include "freertos/queue.h"
 #include "comm.h"
 #include "touch.h"
 #include "gui.h"
@@ -47,15 +48,51 @@ static esp_lcd_panel_handle_t s_panel = NULL;
 
 static esp_err_t display_set_brightness(int percent);  /* forward declaration */
 
-/* Button actions */
+/* ---------- Fireplace command task ---------- */
+typedef enum { CMD_FIREPLACE_ENABLE, CMD_FIREPLACE_DISABLE } fireplace_cmd_t;
+
+#define CMD_MAX_RETRIES 3
+
+static QueueHandle_t s_cmd_queue;
+
+static void comm_cmd_task(void *arg)
+{
+    fireplace_cmd_t cmd;
+    while (1) {
+        xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY);
+
+        const char *name = (cmd == CMD_FIREPLACE_ENABLE) ? "ENABLE" : "DISABLE";
+        for (int attempt = 1; attempt <= CMD_MAX_RETRIES; attempt++) {
+            esp_err_t ret = (cmd == CMD_FIREPLACE_ENABLE)
+                ? comm_fireplace_enable()
+                : comm_fireplace_disable();
+
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "Fireplace %s: ACK (attempt %d/%d)", name, attempt, CMD_MAX_RETRIES);
+                break;
+            }
+            ESP_LOGW(TAG, "Fireplace %s: attempt %d/%d failed: %s",
+                     name, attempt, CMD_MAX_RETRIES, esp_err_to_name(ret));
+            if (attempt == CMD_MAX_RETRIES) {
+                ESP_LOGE(TAG, "Fireplace %s: all retries exhausted", name);
+            }
+        }
+    }
+}
+
+/* Button actions — post to command queue (non-blocking, latest wins) */
 static void action_light_up(void)
 {
     ESP_LOGI(TAG, "*** BUTTON PRESSED: Light Up (orange) ***");
+    fireplace_cmd_t cmd = CMD_FIREPLACE_ENABLE;
+    xQueueOverwrite(s_cmd_queue, &cmd);
 }
 
 static void action_extinguish(void)
 {
     ESP_LOGI(TAG, "*** BUTTON PRESSED: Extinguish (blue) ***");
+    fireplace_cmd_t cmd = CMD_FIREPLACE_DISABLE;
+    xQueueOverwrite(s_cmd_queue, &cmd);
 }
 
 static void on_time_received(const struct tm *t)
@@ -244,6 +281,9 @@ extern const uint8_t fireplace_bin_end[]   asm("_binary_fireplace_bin_end");
 
 void app_main(void)
 {
+    s_cmd_queue = xQueueCreate(1, sizeof(fireplace_cmd_t));
+    xTaskCreate(comm_cmd_task, "comm_cmd", 4096, NULL, 5, NULL);
+
     ESP_ERROR_CHECK(comm_init(on_time_received));
     ESP_ERROR_CHECK(display_backlight_init());
     ESP_ERROR_CHECK(display_init());
