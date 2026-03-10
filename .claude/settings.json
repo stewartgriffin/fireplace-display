@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(md5 /Users/tomaszziajko/code/fireplace-display/fireplace.png /Users/tomaszziajko/code/fireplace-display/main/fireplace.bin)"
+      "Bash(md5 /Users/tomaszziajko/code/fireplace-display/fireplace.png /Users/tomaszziajko/code/fireplace-display/main/fireplace.bin)",
+      "WebSearch",
+      "WebFetch(domain:docs.espressif.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.waveshare.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:spotpear.com)",
+      "WebFetch(domain:files.waveshare.com)"
     ]
   }
 }

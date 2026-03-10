@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -12,6 +14,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_cache.h"
+#include "comm.h"
 
 static const char *TAG = "fireplace";
 
@@ -38,6 +41,15 @@ static const char *TAG = "fireplace";
 #define LCD_BL_LEDC_FREQ_HZ     5000
 
 static esp_lcd_panel_handle_t s_panel = NULL;
+
+static void on_time_received(const struct tm *t)
+{
+    struct timeval tv = { .tv_sec = mktime((struct tm *)t), .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "Time set: %04d-%02d-%02d %02d:%02d:%02d",
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+}
 
 static esp_err_t display_backlight_init(void)
 {
@@ -216,6 +228,7 @@ extern const uint8_t fireplace_bin_end[]   asm("_binary_fireplace_bin_end");
 
 void app_main(void)
 {
+    ESP_ERROR_CHECK(comm_init(on_time_received));
     ESP_ERROR_CHECK(display_backlight_init());
     ESP_ERROR_CHECK(display_init());
 
