@@ -8,7 +8,6 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "esp_check.h"
 
 static const char *TAG = "comm";
@@ -23,7 +22,6 @@ static const char *TAG = "comm";
 #define COMM_SOF            0xAA
 #define COMM_MAX_PAYLOAD    8
 #define COMM_ACK_TIMEOUT_MS 300
-#define COMM_TIME_POLL_US   (60LL * 1000 * 1000)
 
 /* ---------- Message IDs ---------- */
 #define MSG_FIREPLACE_ENABLE    0x01
@@ -34,6 +32,8 @@ static const char *TAG = "comm";
 #define MSG_ACK                 0x81
 #define MSG_NACK                0x82
 #define MSG_TIME_RESPONSE       0x83
+#define MSG_STATUS_REQUEST      0x06
+#define MSG_STATUS_RESPONSE     0x84
 
 /* ---------- Internal state ---------- */
 typedef struct {
@@ -41,8 +41,9 @@ typedef struct {
     uint8_t echoed_id;  /* MSG_ID from payload[0] */
 } ack_result_t;
 
-static comm_time_cb_t  s_time_cb;
-static QueueHandle_t   s_ack_queue;
+static comm_time_cb_t   s_time_cb;
+static comm_status_cb_t s_status_cb;
+static QueueHandle_t    s_ack_queue;
 static SemaphoreHandle_t s_tx_mutex;
 
 /* ---------- CRC16-Modbus ---------- */
@@ -171,6 +172,25 @@ static void rx_task(void *arg)
                 if (s_time_cb) s_time_cb(&t);
                 break;
             }
+            case MSG_STATUS_RESPONSE: {
+                if (len < 7) {
+                    ESP_LOGW(TAG, "Short STATUS_RESPONSE (%d bytes)", len);
+                    break;
+                }
+                combustion_controler_info_t s = {
+                    .ext_temp        = (int16_t)(((uint16_t)payload[0] << 8) | payload[1]),
+                    .exhaust_temp    = (int16_t)(((uint16_t)payload[2] << 8) | payload[3]),
+                    .vent_pct        = payload[4],
+                    .fire_pct        = payload[5],
+                    .combustion_state = payload[6],
+                };
+                ESP_LOGD(TAG, "STATUS ext=%d.%d exhaust=%d.%d vent=%d%% fire=%d%% comb=%d",
+                         s.ext_temp / 10, abs(s.ext_temp % 10),
+                         s.exhaust_temp / 10, abs(s.exhaust_temp % 10),
+                         s.vent_pct, s.fire_pct, s.combustion_state);
+                if (s_status_cb) s_status_cb(&s);
+                break;
+            }
             default:
                 ESP_LOGW(TAG, "Unknown msg_id 0x%02x", msg_id);
                 break;
@@ -178,13 +198,12 @@ static void rx_task(void *arg)
     }
 }
 
-/* ---------- Periodic time poll ---------- */
-static void time_poll_cb(void *arg)
-{
-    comm_request_time();
-}
-
 /* ---------- Public API ---------- */
+
+void comm_set_status_cb(comm_status_cb_t cb)
+{
+    s_status_cb = cb;
+}
 
 esp_err_t comm_init(comm_time_cb_t on_time_received)
 {
@@ -208,14 +227,6 @@ esp_err_t comm_init(comm_time_cb_t on_time_received)
 
     xTaskCreate(rx_task, "comm_rx", 4096, NULL, 5, NULL);
 
-    const esp_timer_create_args_t timer_args = {
-        .callback = time_poll_cb,
-        .name     = "comm_time_poll",
-    };
-    esp_timer_handle_t timer;
-    ESP_RETURN_ON_ERROR(esp_timer_create(&timer_args, &timer), TAG, "Timer create failed");
-    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(timer, COMM_TIME_POLL_US), TAG, "Timer start failed");
-
     ESP_LOGI(TAG, "Initialised at %d baud", COMM_BAUD_RATE);
     comm_request_time();  /* sync time on startup */
     return ESP_OK;
@@ -230,6 +241,14 @@ esp_err_t comm_request_time(void)
 {
     xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
     esp_err_t ret = send_frame(MSG_TIME_REQUEST, NULL, 0);
+    xSemaphoreGive(s_tx_mutex);
+    return ret;
+}
+
+esp_err_t comm_request_status(void)
+{
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    esp_err_t ret = send_frame(MSG_STATUS_REQUEST, NULL, 0);
     xSemaphoreGive(s_tx_mutex);
     return ret;
 }

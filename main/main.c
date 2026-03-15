@@ -19,6 +19,8 @@
 #include "comm.h"
 #include "touch.h"
 #include "gui.h"
+#include "backlight_manager.h"
+#include "power_manager.h"
 
 static const char *TAG = "fireplace";
 
@@ -47,6 +49,7 @@ static const char *TAG = "fireplace";
 static esp_lcd_panel_handle_t s_panel = NULL;
 
 static esp_err_t display_set_brightness(int percent);  /* forward declaration */
+static void set_brightness_void(int percent) { display_set_brightness(percent); }
 
 /* ---------- Fireplace command task ---------- */
 typedef enum { CMD_FIREPLACE_ENABLE, CMD_FIREPLACE_DISABLE } fireplace_cmd_t;
@@ -95,13 +98,48 @@ static void action_extinguish(void)
     xQueueOverwrite(s_cmd_queue, &cmd);
 }
 
+/* ---------- RTC persistence across resets ---------- */
+#define RTC_MAGIC 0xCA7C10CC
+
+static RTC_DATA_ATTR struct {
+    time_t  saved_time;
+    uint32_t magic;
+} s_rtc;
+
+static void rtc_restore(void)
+{
+    if (s_rtc.magic != RTC_MAGIC || s_rtc.saved_time <= 0) {
+        ESP_LOGI(TAG, "No valid RTC time saved");
+        return;
+    }
+    struct timeval tv = { .tv_sec = s_rtc.saved_time, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    struct tm t;
+    localtime_r(&tv.tv_sec, &t);
+    ESP_LOGI(TAG, "RTC restored: %04d-%02d-%02d %02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+}
+
 static void on_time_received(const struct tm *t)
 {
     struct timeval tv = { .tv_sec = mktime((struct tm *)t), .tv_usec = 0 };
     settimeofday(&tv, NULL);
-    ESP_LOGI(TAG, "Time set: %04d-%02d-%02d %02d:%02d:%02d",
+    s_rtc.saved_time = tv.tv_sec;
+    s_rtc.magic      = RTC_MAGIC;
+    ESP_LOGI(TAG, "Time synced: %04d-%02d-%02d %02d:%02d:%02d",
              t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
              t->tm_hour, t->tm_min, t->tm_sec);
+    power_manager_on_time_synced();
+}
+
+/* Touch handler — power_manager gets first chance to consume the event */
+static void handle_touch(uint16_t x, uint16_t y)
+{
+    if (power_manager_on_touch()) {
+        return;  /* first-wake tap: backlight activated, button not triggered */
+    }
+    gui_handle_touch(x, y);
 }
 
 static esp_err_t display_backlight_init(void)
@@ -281,6 +319,8 @@ extern const uint8_t fireplace_bin_end[]   asm("_binary_fireplace_bin_end");
 
 void app_main(void)
 {
+    rtc_restore();
+
     s_cmd_queue = xQueueCreate(1, sizeof(fireplace_cmd_t));
     xTaskCreate(comm_cmd_task, "comm_cmd", 4096, NULL, 5, NULL);
 
@@ -297,6 +337,8 @@ void app_main(void)
 
     /* Initialise GUI and register buttons */
     gui_init((uint16_t *)fb, LCD_H_RES, LCD_V_RES);
+    ESP_ERROR_CHECK(power_manager_init((uint16_t *)fb, LCD_H_RES, LCD_V_RES,
+                                       fireplace_bin_start, fb_size));
 
     /* Orange "light up" button: user coords BL(49,546) TR(357,651)
      * screen coords (y = 720 - y_user): x=49, y=69, w=308, h=105 */
@@ -316,10 +358,10 @@ void app_main(void)
     };
     gui_register_button(&btn_ext);
 
-    ESP_ERROR_CHECK(touch_init(gui_handle_touch));
-
-    /* Turn on backlight at full brightness */
-    ESP_ERROR_CHECK(display_set_brightness(100));
+    comm_set_status_cb(gui_on_controller_info);
+    gui_set_touch_callback(backlight_manager_on_button_press);
+    ESP_ERROR_CHECK(touch_init(handle_touch));
+    ESP_ERROR_CHECK(backlight_manager_init(set_brightness_void));
 
     ESP_LOGI(TAG, "Display ready");
 }
