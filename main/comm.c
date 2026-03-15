@@ -9,6 +9,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_timer.h"
 
 static const char *TAG = "comm";
 
@@ -35,6 +36,10 @@ static const char *TAG = "comm";
 #define MSG_STATUS_REQUEST      0x06
 #define MSG_STATUS_RESPONSE     0x84
 
+/* ---------- Time-sync retry ---------- */
+#define TIME_RETRY_US   (1LL * 1000000LL)
+#define TIME_RETRY_MAX  5
+
 /* ---------- Internal state ---------- */
 typedef struct {
     uint8_t type;       /* MSG_ACK or MSG_NACK */
@@ -45,6 +50,9 @@ static comm_time_cb_t    time_cb;
 static comm_status_cb_t  status_cb;
 static QueueHandle_t     ack_queue;
 static SemaphoreHandle_t tx_mutex;
+static esp_timer_handle_t time_retry_timer = NULL;
+static volatile int       time_retry_count = 0;
+static volatile bool      time_sync_pending = false;
 
 /* ---------- CRC16-Modbus ---------- */
 static uint16_t crc16_modbus(const uint8_t *data, size_t len)
@@ -160,6 +168,8 @@ static void rx_task(void *arg)
                     ESP_LOGW(TAG, "Short TIME_RESPONSE (%d bytes)", len);
                     break;
                 }
+                time_sync_pending = false;
+                esp_timer_stop(time_retry_timer);
                 struct tm t = {
                     .tm_year = (((int)payload[0] << 8) | payload[1]) - 1900,
                     .tm_mon  = payload[2] - 1,
@@ -205,11 +215,32 @@ void comm_set_status_cb(comm_status_cb_t cb)
     status_cb = cb;
 }
 
+static void time_retry_cb(void *arg)
+{
+    if (!time_sync_pending) return;
+
+    if (++time_retry_count <= TIME_RETRY_MAX) {
+        xSemaphoreTake(tx_mutex, portMAX_DELAY);
+        send_frame(MSG_TIME_REQUEST, NULL, 0);
+        xSemaphoreGive(tx_mutex);
+        ESP_LOGI(TAG, "Time sync retry %d/%d", time_retry_count, TIME_RETRY_MAX);
+        esp_timer_start_once(time_retry_timer, TIME_RETRY_US);
+    } else {
+        ESP_LOGW(TAG, "Time sync: no response after %d retries", TIME_RETRY_MAX);
+    }
+}
+
 esp_err_t comm_init(comm_time_cb_t on_time_received)
 {
     time_cb  = on_time_received;
     ack_queue = xQueueCreate(1, sizeof(ack_result_t));
     tx_mutex  = xSemaphoreCreateMutex();
+
+    const esp_timer_create_args_t retry_args = {
+        .callback = time_retry_cb,
+        .name     = "time_retry",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&retry_args, &time_retry_timer), TAG, "time retry timer create failed");
 
     const uart_config_t uart_cfg = {
         .baud_rate  = COMM_BAUD_RATE,
@@ -239,9 +270,15 @@ esp_err_t comm_ventilation_disable(void) { return send_command(MSG_VENTILATION_D
 
 esp_err_t comm_request_time(void)
 {
+    time_sync_pending = true;
+    time_retry_count  = 0;
+    esp_timer_stop(time_retry_timer);
+
     xSemaphoreTake(tx_mutex, portMAX_DELAY);
     esp_err_t ret = send_frame(MSG_TIME_REQUEST, NULL, 0);
     xSemaphoreGive(tx_mutex);
+
+    esp_timer_start_once(time_retry_timer, TIME_RETRY_US);
     return ret;
 }
 

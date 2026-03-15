@@ -17,9 +17,9 @@ static const char *TAG = "logic";
 #define STATUS_POLL_PERIOD_US   (5LL * 1000000LL)
 
 static SemaphoreHandle_t  mutex;
-static esp_timer_handle_t status_timer    = NULL;
-static bool               sync_pending    = false;
-static bool               error_shown     = false;
+static esp_timer_handle_t status_timer = NULL;
+static bool               sync_pending = false;
+static bool               error_shown  = false;
 
 static const uint8_t *fireplace_data = NULL;
 static size_t         fireplace_size = 0;
@@ -48,7 +48,15 @@ static void poll_timer_cb(void *arg)
 
 static void status_poll_cb(void *arg)
 {
-    if (backlight_manager_is_on()) {
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    bool pending = sync_pending;
+    xSemaphoreGive(mutex);
+
+    /* Skip status poll when a time sync is in flight — on a half-duplex RS485
+     * bus the controller may drop the time request if hit with two frames at
+     * once, and since the poll and status timers share a 60 s common period
+     * they fire simultaneously every minute. */
+    if (!pending && backlight_manager_is_on()) {
         comm_request_status();
     }
 }
@@ -61,6 +69,10 @@ esp_err_t logic_init(const uint8_t *fireplace_img, size_t fireplace_sz)
     fireplace_data = fireplace_img;
     fireplace_size = fireplace_sz;
     mutex          = xSemaphoreCreateMutex();
+
+    /* comm_init already sent the initial time request (with retry).
+     * Mark sync as pending so poll_timer_cb can detect a missed response. */
+    sync_pending = true;
 
     esp_timer_handle_t timer;
     const esp_timer_create_args_t poll_args = {
