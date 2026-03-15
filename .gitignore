@@ -5,3 +5,4 @@ dependencies.lock
 managed_components/
 .vscode/
 .cache/
+.DS_Store

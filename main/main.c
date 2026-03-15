@@ -21,6 +21,7 @@
 #include "gui.h"
 #include "backlight_manager.h"
 #include "power_manager.h"
+#include "logic.h"
 
 static const char *TAG = "fireplace";
 
@@ -40,29 +41,42 @@ static const char *TAG = "fireplace";
 #define MIPI_DSI_LDO_CHAN       3
 #define MIPI_DSI_LDO_MV         2500
 
+/* ---------- CPU frequency scaling ----------
+ * 0 — CPU runs at minimum frequency at all times (sufficient for this app).
+ * 1 — CPU boosts to maximum when the display override is active (touched),
+ *     and drops back to minimum in evening mode and standby. */
+#define USE_MAX_CPU_FREQ    0
+
 /* ---------- Backlight (LEDC) ---------- */
 #define LCD_BL_LEDC_TIMER       LEDC_TIMER_1
 #define LCD_BL_LEDC_CH          LEDC_CHANNEL_1
 #define LCD_BL_LEDC_DUTY_RES    LEDC_TIMER_10_BIT
 #define LCD_BL_LEDC_FREQ_HZ     5000
 
-static esp_lcd_panel_handle_t s_panel = NULL;
+static esp_lcd_panel_handle_t panel = NULL;
 
 static esp_err_t display_set_brightness(int percent);  /* forward declaration */
-static void set_brightness_void(int percent) { display_set_brightness(percent); }
+static void set_brightness_void(int percent) {
+    ESP_LOGI(TAG, "set_brightness: %d%%", percent);
+    display_set_brightness(percent);
+#if USE_MAX_CPU_FREQ
+    /* High frequency only during button override (100 %); low otherwise */
+    power_manager_set_active(percent == 100);
+#endif
+}
 
 /* ---------- Fireplace command task ---------- */
 typedef enum { CMD_FIREPLACE_ENABLE, CMD_FIREPLACE_DISABLE } fireplace_cmd_t;
 
 #define CMD_MAX_RETRIES 3
 
-static QueueHandle_t s_cmd_queue;
+static QueueHandle_t cmd_queue;
 
 static void comm_cmd_task(void *arg)
 {
     fireplace_cmd_t cmd;
     while (1) {
-        xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY);
+        xQueueReceive(cmd_queue, &cmd, portMAX_DELAY);
 
         const char *name = (cmd == CMD_FIREPLACE_ENABLE) ? "ENABLE" : "DISABLE";
         for (int attempt = 1; attempt <= CMD_MAX_RETRIES; attempt++) {
@@ -88,14 +102,14 @@ static void action_light_up(void)
 {
     ESP_LOGI(TAG, "*** BUTTON PRESSED: Light Up (orange) ***");
     fireplace_cmd_t cmd = CMD_FIREPLACE_ENABLE;
-    xQueueOverwrite(s_cmd_queue, &cmd);
+    xQueueOverwrite(cmd_queue, &cmd);
 }
 
 static void action_extinguish(void)
 {
     ESP_LOGI(TAG, "*** BUTTON PRESSED: Extinguish (blue) ***");
     fireplace_cmd_t cmd = CMD_FIREPLACE_DISABLE;
-    xQueueOverwrite(s_cmd_queue, &cmd);
+    xQueueOverwrite(cmd_queue, &cmd);
 }
 
 /* ---------- RTC persistence across resets ---------- */
@@ -104,15 +118,15 @@ static void action_extinguish(void)
 static RTC_DATA_ATTR struct {
     time_t  saved_time;
     uint32_t magic;
-} s_rtc;
+} rtc;
 
 static void rtc_restore(void)
 {
-    if (s_rtc.magic != RTC_MAGIC || s_rtc.saved_time <= 0) {
+    if (rtc.magic != RTC_MAGIC || rtc.saved_time <= 0) {
         ESP_LOGI(TAG, "No valid RTC time saved");
         return;
     }
-    struct timeval tv = { .tv_sec = s_rtc.saved_time, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = rtc.saved_time, .tv_usec = 0 };
     settimeofday(&tv, NULL);
     struct tm t;
     localtime_r(&tv.tv_sec, &t);
@@ -125,18 +139,18 @@ static void on_time_received(const struct tm *t)
 {
     struct timeval tv = { .tv_sec = mktime((struct tm *)t), .tv_usec = 0 };
     settimeofday(&tv, NULL);
-    s_rtc.saved_time = tv.tv_sec;
-    s_rtc.magic      = RTC_MAGIC;
+    rtc.saved_time = tv.tv_sec;
+    rtc.magic      = RTC_MAGIC;
     ESP_LOGI(TAG, "Time synced: %04d-%02d-%02d %02d:%02d:%02d",
              t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
              t->tm_hour, t->tm_min, t->tm_sec);
-    power_manager_on_time_synced();
+    logic_on_time_synced();
 }
 
 /* Touch handler — power_manager gets first chance to consume the event */
 static void handle_touch(uint16_t x, uint16_t y)
 {
-    if (power_manager_on_touch()) {
+    if (logic_on_touch()) {
         return;  /* first-wake tap: backlight activated, button not triggered */
     }
     gui_handle_touch(x, y);
@@ -168,12 +182,23 @@ static esp_err_t display_backlight_init(void)
     return ESP_OK;
 }
 
+/* Backlight hardware usable range: [48%, 100%]. Values 1-100 are scaled into
+ * this range so the full logical range maps to visible brightness steps. */
+#define BL_HW_MIN_PCT   48
+
 static esp_err_t display_set_brightness(int percent)
 {
     if (percent < 0)   percent = 0;
     if (percent > 100) percent = 100;
 
-    uint32_t duty = ((1 << LCD_BL_LEDC_DUTY_RES) - 1) * percent / 100;
+    uint32_t duty;
+    if (percent == 0) {
+        duty = 0;
+    } else {
+        /* Map [1, 100] → [BL_HW_MIN_PCT, 100] linearly */
+        int hw_pct = BL_HW_MIN_PCT + (100 - BL_HW_MIN_PCT) * (percent - 1) / 99;
+        duty = ((1 << LCD_BL_LEDC_DUTY_RES) - 1) * hw_pct / 100;
+    }
     ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LCD_BL_LEDC_CH, duty),
                         TAG, "LEDC set duty failed");
     ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, LCD_BL_LEDC_CH),
@@ -191,12 +216,12 @@ static esp_err_t display_set_brightness(int percent)
 static esp_err_t display_init(void)
 {
     /* Power on the MIPI DSI PHY via the on-chip LDO */
-    static esp_ldo_channel_handle_t s_phy_ldo = NULL;
+    static esp_ldo_channel_handle_t phy_ldo = NULL;
     const esp_ldo_channel_config_t ldo_cfg = {
         .chan_id    = MIPI_DSI_LDO_CHAN,
         .voltage_mv = MIPI_DSI_LDO_MV,
     };
-    ESP_RETURN_ON_ERROR(esp_ldo_acquire_channel(&ldo_cfg, &s_phy_ldo),
+    ESP_RETURN_ON_ERROR(esp_ldo_acquire_channel(&ldo_cfg, &phy_ldo),
                         TAG, "LDO acquire failed");
     ESP_LOGI(TAG, "MIPI DSI PHY powered on");
 
@@ -305,9 +330,9 @@ static esp_err_t display_init(void)
         },
         .flags.use_dma2d = true,
     };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_dpi(dsi_bus, &dpi_cfg, &s_panel),
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_dpi(dsi_bus, &dpi_cfg, &panel),
                         TAG, "DPI panel create failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "Panel init failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "Panel init failed");
 
     ESP_LOGI(TAG, "Display initialised (%dx%d)", LCD_H_RES, LCD_V_RES);
     return ESP_OK;
@@ -321,7 +346,7 @@ void app_main(void)
 {
     rtc_restore();
 
-    s_cmd_queue = xQueueCreate(1, sizeof(fireplace_cmd_t));
+    cmd_queue = xQueueCreate(1, sizeof(fireplace_cmd_t));
     xTaskCreate(comm_cmd_task, "comm_cmd", 4096, NULL, 5, NULL);
 
     ESP_ERROR_CHECK(comm_init(on_time_received));
@@ -330,15 +355,18 @@ void app_main(void)
 
     /* Copy fireplace image into the DPI frame buffer */
     void *fb = NULL;
-    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &fb));
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(panel, 1, &fb));
     size_t fb_size = LCD_H_RES * LCD_V_RES * sizeof(uint16_t);
     memcpy(fb, fireplace_bin_start, fb_size);
     esp_cache_msync(fb, fb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 
     /* Initialise GUI and register buttons */
     gui_init((uint16_t *)fb, LCD_H_RES, LCD_V_RES);
-    ESP_ERROR_CHECK(power_manager_init((uint16_t *)fb, LCD_H_RES, LCD_V_RES,
-                                       fireplace_bin_start, fb_size));
+    ESP_ERROR_CHECK(power_manager_init());
+#if !USE_MAX_CPU_FREQ
+    power_manager_set_active(false);  /* release boot-time lock — stay at low frequency */
+#endif
+    ESP_ERROR_CHECK(logic_init(fireplace_bin_start, fb_size));
 
     /* Orange "light up" button: user coords BL(49,546) TR(357,651)
      * screen coords (y = 720 - y_user): x=49, y=69, w=308, h=105 */

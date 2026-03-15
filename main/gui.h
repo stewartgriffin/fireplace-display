@@ -12,7 +12,7 @@ typedef struct {
     gui_action_t on_press;
 } gui_button_t;
 
-void gui_init(uint16_t *fb, uint16_t fb_w, uint16_t fb_h);
+void gui_init(uint16_t *buf, uint16_t w, uint16_t h);
 void gui_register_button(const gui_button_t *btn);
 /* Called on every touch event, before button hit-testing. Pass NULL to clear. */
 void gui_set_touch_callback(gui_action_t cb);
@@ -25,3 +25,7 @@ void gui_on_controller_info(const combustion_controler_info_t *info);
 /* Re-render the last received controller info.
    Call after restoring the background image to avoid stale display. */
 void gui_redraw_status(void);
+
+/* Full-screen rendering — used by logic module for error/recovery screens. */
+void gui_show_error(const char *l1, const char *l2, const char *l3);
+void gui_show_fireplace(const uint8_t *img, size_t sz);

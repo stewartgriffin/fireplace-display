@@ -17,8 +17,8 @@ static const char *TAG = "touch";
 #define TOUCH_X_MAX         720
 #define TOUCH_Y_MAX         720
 
-static esp_lcd_touch_handle_t s_touch = NULL;
-static touch_event_cb_t s_cb = NULL;
+static esp_lcd_touch_handle_t touch = NULL;
+static touch_event_cb_t cb = NULL;
 
 static void touch_task(void *arg)
 {
@@ -27,11 +27,11 @@ static void touch_task(void *arg)
     bool was_touched = false;
 
     while (1) {
-        esp_lcd_touch_read_data(s_touch);
-        esp_lcd_touch_get_data(s_touch, points, &cnt, 1);
+        esp_lcd_touch_read_data(touch);
+        esp_lcd_touch_get_data(touch, points, &cnt, 1);
         bool touching = (cnt > 0);
-        if (touching && !was_touched && s_cb) {
-            s_cb(points[0].x, points[0].y);
+        if (touching && !was_touched && cb) {
+            cb(points[0].x, points[0].y);
         }
         was_touched = touching;
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -40,7 +40,7 @@ static void touch_task(void *arg)
 
 esp_err_t touch_init(touch_event_cb_t on_touch)
 {
-    s_cb = on_touch;
+    cb = on_touch;
 
     /* Initialize I2C master bus */
     i2c_master_bus_config_t bus_cfg = {
@@ -79,7 +79,7 @@ esp_err_t touch_init(touch_event_cb_t on_touch)
         },
     };
     ESP_RETURN_ON_ERROR(
-        esp_lcd_touch_new_i2c_gt911(tp_io, &tp_cfg, &s_touch),
+        esp_lcd_touch_new_i2c_gt911(tp_io, &tp_cfg, &touch),
         TAG, "GT911 init failed");
 
     xTaskCreate(touch_task, "touch", 2048, NULL, 5, NULL);

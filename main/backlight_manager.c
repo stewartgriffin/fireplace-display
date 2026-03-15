@@ -10,17 +10,17 @@
 
 static const char *TAG = "backlight";
 
-#define DAY_BRIGHTNESS_DEFAULT  20
-#define DAY_BRIGHTNESS_MIN      10
+#define DAY_BRIGHTNESS_DEFAULT  10
+#define DAY_BRIGHTNESS_MIN      1
 #define DAY_BRIGHTNESS_MAX      100
 #define DAY_BRIGHTNESS_STEP     10
 #define BUTTON_OVERRIDE_MS      (60 * 1000LL)
 #define TASK_PERIOD_MS          60000   /* re-evaluate every minute */
 
-/* Backlight turns off after this hour every day */
+/* Evening mode ends (backlight turns off) after this hour every day */
 #define NIGHT_START_HOUR    23
 
-/* Evening turn-on time varies by day of year (cosine interpolation, 1-minute resolution).
+/* Evening mode turn-on time varies by day of year (cosine interpolation, 1-minute resolution).
  * Reference points:  Dec 24 (tm_yday=357) → 15:00 (900 min)
  *                    Jun 20 (tm_yday=170) → 20:45 (1245 min)
  * Solved: center=1072.75, amplitude=172.75  */
@@ -35,26 +35,26 @@ static int seasonal_on_minutes(int yday)  /* returns minutes since midnight */
     return (int)round(m);
 }
 
-static backlight_set_fn  s_set_fn;
-static int               s_day_brightness    = DAY_BRIGHTNESS_DEFAULT;
-static int               s_current_brightness = 0;
-static int64_t           s_button_press_us   = 0;  /* 0 = no active override */
-static SemaphoreHandle_t s_mutex;
+static backlight_set_fn  set_fn;
+static int               day_brightness    = DAY_BRIGHTNESS_DEFAULT;
+static int               current_brightness = 0;
+static int64_t           button_press_us   = 0;  /* 0 = no active override */
+static SemaphoreHandle_t mutex;
 
 /* Compute and apply the current brightness level. May be called from any task. */
 static void apply_backlight(void)
 {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    xSemaphoreTake(mutex, portMAX_DELAY);
 
     int brightness;
     bool use_override = false;
 
-    if (s_button_press_us > 0) {
-        int64_t elapsed_ms = (esp_timer_get_time() - s_button_press_us) / 1000;
+    if (button_press_us > 0) {
+        int64_t elapsed_ms = (esp_timer_get_time() - button_press_us) / 1000;
         if (elapsed_ms < BUTTON_OVERRIDE_MS) {
             use_override = true;
         } else {
-            s_button_press_us = 0;
+            button_press_us = 0;
             ESP_LOGI(TAG, "Button override expired, resuming schedule");
         }
     }
@@ -69,20 +69,23 @@ static void apply_backlight(void)
         int current_min = t.tm_hour * 60 + t.tm_min;
         int on_min      = seasonal_on_minutes(t.tm_yday);
         int night_min   = NIGHT_START_HOUR * 60;
-        bool on = (current_min >= on_min && current_min < night_min);
-        brightness = on ? s_day_brightness : 0;
+        bool time_valid = (t.tm_year + 1900 >= 2020);
+        bool on = !time_valid || (current_min >= on_min && current_min < night_min);
+        brightness = on ? day_brightness : 0;
+        ESP_LOGI(TAG, "schedule: time_valid=%d cur=%d on_min=%d night=%d on=%d -> %d%%",
+                 time_valid, current_min, on_min, night_min, on, brightness);
     }
 
-    s_current_brightness = brightness;
-    xSemaphoreGive(s_mutex);
-    s_set_fn(brightness);
+    current_brightness = brightness;
+    xSemaphoreGive(mutex);
+    set_fn(brightness);
 }
 
 bool backlight_manager_is_on(void)
 {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    bool on = s_current_brightness > 0;
-    xSemaphoreGive(s_mutex);
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    bool on = current_brightness > 0;
+    xSemaphoreGive(mutex);
     return on;
 }
 
@@ -96,8 +99,8 @@ static void backlight_task(void *arg)
 
 esp_err_t backlight_manager_init(backlight_set_fn set_brightness)
 {
-    s_set_fn = set_brightness;
-    s_mutex  = xSemaphoreCreateMutex();
+    set_fn = set_brightness;
+    mutex  = xSemaphoreCreateMutex();
     xTaskCreate(backlight_task, "backlight", 2048, NULL, 3, NULL);
     ESP_LOGI(TAG, "Started (day=%d%%, step=%d%%, on-time seasonal Dec24=15:00 Jun20=20:45)",
              DAY_BRIGHTNESS_DEFAULT, DAY_BRIGHTNESS_STEP);
@@ -106,31 +109,31 @@ esp_err_t backlight_manager_init(backlight_set_fn set_brightness)
 
 void backlight_manager_up(void)
 {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_day_brightness += DAY_BRIGHTNESS_STEP;
-    if (s_day_brightness > DAY_BRIGHTNESS_MAX) s_day_brightness = DAY_BRIGHTNESS_MAX;
-    int b = s_day_brightness;
-    xSemaphoreGive(s_mutex);
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    day_brightness += DAY_BRIGHTNESS_STEP;
+    if (day_brightness > DAY_BRIGHTNESS_MAX) day_brightness = DAY_BRIGHTNESS_MAX;
+    int b = day_brightness;
+    xSemaphoreGive(mutex);
     ESP_LOGI(TAG, "Brightness up → %d%%", b);
     apply_backlight();
 }
 
 void backlight_manager_down(void)
 {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_day_brightness -= DAY_BRIGHTNESS_STEP;
-    if (s_day_brightness < DAY_BRIGHTNESS_MIN) s_day_brightness = DAY_BRIGHTNESS_MIN;
-    int b = s_day_brightness;
-    xSemaphoreGive(s_mutex);
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    day_brightness -= DAY_BRIGHTNESS_STEP;
+    if (day_brightness < DAY_BRIGHTNESS_MIN) day_brightness = DAY_BRIGHTNESS_MIN;
+    int b = day_brightness;
+    xSemaphoreGive(mutex);
     ESP_LOGI(TAG, "Brightness down → %d%%", b);
     apply_backlight();
 }
 
 void backlight_manager_on_button_press(void)
 {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_button_press_us = esp_timer_get_time();
-    xSemaphoreGive(s_mutex);
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    button_press_us = esp_timer_get_time();
+    xSemaphoreGive(mutex);
     ESP_LOGI(TAG, "Button press: 100%% for 60 s");
     apply_backlight();
 }

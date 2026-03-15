@@ -41,10 +41,10 @@ typedef struct {
     uint8_t echoed_id;  /* MSG_ID from payload[0] */
 } ack_result_t;
 
-static comm_time_cb_t   s_time_cb;
-static comm_status_cb_t s_status_cb;
-static QueueHandle_t    s_ack_queue;
-static SemaphoreHandle_t s_tx_mutex;
+static comm_time_cb_t    time_cb;
+static comm_status_cb_t  status_cb;
+static QueueHandle_t     ack_queue;
+static SemaphoreHandle_t tx_mutex;
 
 /* ---------- CRC16-Modbus ---------- */
 static uint16_t crc16_modbus(const uint8_t *data, size_t len)
@@ -80,27 +80,27 @@ static esp_err_t send_frame(uint8_t msg_id, const uint8_t *payload, uint8_t len)
 /* ---------- Command send + ACK wait ---------- */
 static esp_err_t send_command(uint8_t msg_id)
 {
-    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    xSemaphoreTake(tx_mutex, portMAX_DELAY);
 
     /* Drain stale ACKs from previous timed-out commands */
     ack_result_t stale;
-    while (xQueueReceive(s_ack_queue, &stale, 0) == pdTRUE) {}
+    while (xQueueReceive(ack_queue, &stale, 0) == pdTRUE) {}
 
     esp_err_t ret = send_frame(msg_id, NULL, 0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Send failed for msg 0x%02x", msg_id);
-        xSemaphoreGive(s_tx_mutex);
+        xSemaphoreGive(tx_mutex);
         return ret;
     }
 
     ack_result_t result;
-    if (xQueueReceive(s_ack_queue, &result, pdMS_TO_TICKS(COMM_ACK_TIMEOUT_MS)) != pdTRUE) {
+    if (xQueueReceive(ack_queue, &result, pdMS_TO_TICKS(COMM_ACK_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "ACK timeout for msg 0x%02x", msg_id);
-        xSemaphoreGive(s_tx_mutex);
+        xSemaphoreGive(tx_mutex);
         return ESP_ERR_TIMEOUT;
     }
 
-    xSemaphoreGive(s_tx_mutex);
+    xSemaphoreGive(tx_mutex);
 
     if (result.type == MSG_NACK) {
         ESP_LOGW(TAG, "NACK received for msg 0x%02x", msg_id);
@@ -152,7 +152,7 @@ static void rx_task(void *arg)
                     .type      = msg_id,
                     .echoed_id = len >= 1 ? payload[0] : 0,
                 };
-                xQueueSend(s_ack_queue, &r, 0);
+                xQueueSend(ack_queue, &r, 0);
                 break;
             }
             case MSG_TIME_RESPONSE: {
@@ -169,7 +169,7 @@ static void rx_task(void *arg)
                     .tm_sec  = payload[6],
                     .tm_isdst = -1,
                 };
-                if (s_time_cb) s_time_cb(&t);
+                if (time_cb) time_cb(&t);
                 break;
             }
             case MSG_STATUS_RESPONSE: {
@@ -188,7 +188,7 @@ static void rx_task(void *arg)
                          s.ext_temp / 10, abs(s.ext_temp % 10),
                          s.exhaust_temp / 10, abs(s.exhaust_temp % 10),
                          s.vent_pct, s.fire_pct, s.combustion_state);
-                if (s_status_cb) s_status_cb(&s);
+                if (status_cb) status_cb(&s);
                 break;
             }
             default:
@@ -202,14 +202,14 @@ static void rx_task(void *arg)
 
 void comm_set_status_cb(comm_status_cb_t cb)
 {
-    s_status_cb = cb;
+    status_cb = cb;
 }
 
 esp_err_t comm_init(comm_time_cb_t on_time_received)
 {
-    s_time_cb  = on_time_received;
-    s_ack_queue = xQueueCreate(1, sizeof(ack_result_t));
-    s_tx_mutex  = xSemaphoreCreateMutex();
+    time_cb  = on_time_received;
+    ack_queue = xQueueCreate(1, sizeof(ack_result_t));
+    tx_mutex  = xSemaphoreCreateMutex();
 
     const uart_config_t uart_cfg = {
         .baud_rate  = COMM_BAUD_RATE,
@@ -239,16 +239,16 @@ esp_err_t comm_ventilation_disable(void) { return send_command(MSG_VENTILATION_D
 
 esp_err_t comm_request_time(void)
 {
-    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    xSemaphoreTake(tx_mutex, portMAX_DELAY);
     esp_err_t ret = send_frame(MSG_TIME_REQUEST, NULL, 0);
-    xSemaphoreGive(s_tx_mutex);
+    xSemaphoreGive(tx_mutex);
     return ret;
 }
 
 esp_err_t comm_request_status(void)
 {
-    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    xSemaphoreTake(tx_mutex, portMAX_DELAY);
     esp_err_t ret = send_frame(MSG_STATUS_REQUEST, NULL, 0);
-    xSemaphoreGive(s_tx_mutex);
+    xSemaphoreGive(tx_mutex);
     return ret;
 }
