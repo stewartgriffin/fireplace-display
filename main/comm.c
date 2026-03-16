@@ -21,8 +21,12 @@ static const char *TAG = "comm";
 
 /* ---------- Protocol constants ---------- */
 #define COMM_SOF            0xAA
-#define COMM_MAX_PAYLOAD    8
+#define COMM_MAX_PAYLOAD    12
 #define COMM_ACK_TIMEOUT_MS 300
+
+/* Maximum time to wait for a response after sending a request.
+   Covers the round-trip on a 115200-baud RS485 link plus STM32 processing. */
+#define COMM_RESP_TIMEOUT_MS 400
 
 /* ---------- Message IDs ---------- */
 #define MSG_FIREPLACE_ENABLE    0x01
@@ -35,6 +39,8 @@ static const char *TAG = "comm";
 #define MSG_TIME_RESPONSE       0x83
 #define MSG_STATUS_REQUEST      0x06
 #define MSG_STATUS_RESPONSE     0x84
+#define MSG_DTDT_REQUEST        0x07
+#define MSG_DTDT_RESPONSE       0x85
 
 /* ---------- Time-sync retry ---------- */
 #define TIME_RETRY_US   (1LL * 1000000LL)
@@ -48,11 +54,60 @@ typedef struct {
 
 static comm_time_cb_t    time_cb;
 static comm_status_cb_t  status_cb;
+static comm_dTdt_cb_t    dTdt_cb;
 static QueueHandle_t     ack_queue;
 static SemaphoreHandle_t tx_mutex;
 static esp_timer_handle_t time_retry_timer = NULL;
 static volatile int       time_retry_count = 0;
 static volatile bool      time_sync_pending = false;
+
+/* ---------- Request queue ---------- */
+#define COMM_REQ_QUEUE_DEPTH 8
+
+static QueueHandle_t     req_queue;  /* holds uint8_t msg_id */
+static SemaphoreHandle_t resp_sem;   /* given by rx_task on each valid response */
+
+/* Dedup bits — set when enqueued, cleared when dequeued by tx_task.
+   Prevents the same request type from piling up in the queue. */
+#define PEND_TIME   0x01
+#define PEND_STATUS 0x02
+#define PEND_DTDT   0x04
+static volatile uint8_t pending_bits = 0;
+static portMUX_TYPE     pend_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint8_t msg_to_pend_bit(uint8_t msg_id)
+{
+    switch (msg_id) {
+        case MSG_TIME_REQUEST:   return PEND_TIME;
+        case MSG_STATUS_REQUEST: return PEND_STATUS;
+        case MSG_DTDT_REQUEST:   return PEND_DTDT;
+        default:                 return 0;
+    }
+}
+
+/* Enqueue a request for tx_task. Returns false if the queue is full or the
+   same request type is already queued (dedup). */
+static bool enqueue_req(uint8_t msg_id)
+{
+    uint8_t bit = msg_to_pend_bit(msg_id);
+    if (bit) {
+        taskENTER_CRITICAL(&pend_mux);
+        bool already = (pending_bits & bit) != 0;
+        if (!already) pending_bits |= bit;
+        taskEXIT_CRITICAL(&pend_mux);
+        if (already) return true;  /* already queued — skip silently */
+    }
+    if (xQueueSend(req_queue, &msg_id, 0) != pdTRUE) {
+        if (bit) {
+            taskENTER_CRITICAL(&pend_mux);
+            pending_bits &= ~bit;
+            taskEXIT_CRITICAL(&pend_mux);
+        }
+        ESP_LOGW(TAG, "req_queue full, dropping 0x%02x", msg_id);
+        return false;
+    }
+    return true;
+}
 
 /* ---------- CRC16-Modbus ---------- */
 static uint16_t crc16_modbus(const uint8_t *data, size_t len)
@@ -115,6 +170,33 @@ static esp_err_t send_command(uint8_t msg_id)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+/* ---------- TX task — serialises all poll requests ---------- */
+static void tx_task(void *arg)
+{
+    uint8_t msg_id;
+    while (1) {
+        xQueueReceive(req_queue, &msg_id, portMAX_DELAY);
+
+        /* Clear dedup bit so the same request type can be enqueued again */
+        uint8_t bit = msg_to_pend_bit(msg_id);
+        if (bit) {
+            taskENTER_CRITICAL(&pend_mux);
+            pending_bits &= ~bit;
+            taskEXIT_CRITICAL(&pend_mux);
+        }
+
+        xSemaphoreTake(tx_mutex, portMAX_DELAY);
+        xSemaphoreTake(resp_sem, 0);   /* flush any stale signal */
+        send_frame(msg_id, NULL, 0);
+        bool got = (xSemaphoreTake(resp_sem, pdMS_TO_TICKS(COMM_RESP_TIMEOUT_MS)) == pdTRUE);
+        xSemaphoreGive(tx_mutex);
+
+        if (!got) {
+            ESP_LOGD(TAG, "No response for req 0x%02x", msg_id);
+        }
+    }
 }
 
 /* ---------- RX task ---------- */
@@ -180,6 +262,7 @@ static void rx_task(void *arg)
                     .tm_isdst = -1,
                 };
                 if (time_cb) time_cb(&t);
+                xSemaphoreGive(resp_sem);
                 break;
             }
             case MSG_STATUS_RESPONSE: {
@@ -199,6 +282,24 @@ static void rx_task(void *arg)
                          s.exhaust_temp / 10, abs(s.exhaust_temp % 10),
                          s.vent_pct, s.fire_pct, s.combustion_state);
                 if (status_cb) status_cb(&s);
+                xSemaphoreGive(resp_sem);
+                break;
+            }
+            case MSG_DTDT_RESPONSE: {
+                if (len < 12) {
+                    ESP_LOGW(TAG, "Short DTDT_RESPONSE (%d bytes)", len);
+                    break;
+                }
+                dTdt_data_t d = {
+                    .dTdt_10s        = (int16_t)(((uint16_t)payload[0]  << 8) | payload[1]),
+                    .dTdt_20s        = (int16_t)(((uint16_t)payload[2]  << 8) | payload[3]),
+                    .dTdt_30s        = (int16_t)(((uint16_t)payload[4]  << 8) | payload[5]),
+                    .sliding_max_10s = (int16_t)(((uint16_t)payload[6]  << 8) | payload[7]),
+                    .sliding_max_20s = (int16_t)(((uint16_t)payload[8]  << 8) | payload[9]),
+                    .sliding_max_30s = (int16_t)(((uint16_t)payload[10] << 8) | payload[11]),
+                };
+                if (dTdt_cb) dTdt_cb(&d);
+                xSemaphoreGive(resp_sem);
                 break;
             }
             default:
@@ -220,9 +321,7 @@ static void time_retry_cb(void *arg)
     if (!time_sync_pending) return;
 
     if (++time_retry_count <= TIME_RETRY_MAX) {
-        xSemaphoreTake(tx_mutex, portMAX_DELAY);
-        send_frame(MSG_TIME_REQUEST, NULL, 0);
-        xSemaphoreGive(tx_mutex);
+        enqueue_req(MSG_TIME_REQUEST);
         ESP_LOGI(TAG, "Time sync retry %d/%d", time_retry_count, TIME_RETRY_MAX);
         esp_timer_start_once(time_retry_timer, TIME_RETRY_US);
     } else {
@@ -232,8 +331,10 @@ static void time_retry_cb(void *arg)
 
 esp_err_t comm_init(comm_time_cb_t on_time_received)
 {
-    time_cb  = on_time_received;
+    time_cb   = on_time_received;
     ack_queue = xQueueCreate(1, sizeof(ack_result_t));
+    req_queue = xQueueCreate(COMM_REQ_QUEUE_DEPTH, sizeof(uint8_t));
+    resp_sem  = xSemaphoreCreateBinary();
     tx_mutex  = xSemaphoreCreateMutex();
 
     const esp_timer_create_args_t retry_args = {
@@ -257,6 +358,7 @@ esp_err_t comm_init(comm_time_cb_t on_time_received)
     ESP_RETURN_ON_ERROR(uart_set_mode(COMM_UART_NUM, UART_MODE_RS485_HALF_DUPLEX), TAG, "UART RS485 mode failed");
 
     xTaskCreate(rx_task, "comm_rx", 4096, NULL, 5, NULL);
+    xTaskCreate(tx_task, "comm_tx", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Initialised at %d baud", COMM_BAUD_RATE);
     comm_request_time();  /* sync time on startup */
@@ -273,19 +375,24 @@ esp_err_t comm_request_time(void)
     time_sync_pending = true;
     time_retry_count  = 0;
     esp_timer_stop(time_retry_timer);
-
-    xSemaphoreTake(tx_mutex, portMAX_DELAY);
-    esp_err_t ret = send_frame(MSG_TIME_REQUEST, NULL, 0);
-    xSemaphoreGive(tx_mutex);
-
+    enqueue_req(MSG_TIME_REQUEST);
     esp_timer_start_once(time_retry_timer, TIME_RETRY_US);
-    return ret;
+    return ESP_OK;
 }
 
 esp_err_t comm_request_status(void)
 {
-    xSemaphoreTake(tx_mutex, portMAX_DELAY);
-    esp_err_t ret = send_frame(MSG_STATUS_REQUEST, NULL, 0);
-    xSemaphoreGive(tx_mutex);
-    return ret;
+    enqueue_req(MSG_STATUS_REQUEST);
+    return ESP_OK;
+}
+
+void comm_set_dTdt_cb(comm_dTdt_cb_t cb)
+{
+    dTdt_cb = cb;
+}
+
+esp_err_t comm_request_dTdt(void)
+{
+    enqueue_req(MSG_DTDT_REQUEST);
+    return ESP_OK;
 }

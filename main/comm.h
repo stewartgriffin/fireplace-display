@@ -20,6 +20,20 @@ typedef struct {
 /* Called from the RX task when a valid STATUS_RESPONSE is received. */
 typedef void (*comm_status_cb_t)(const combustion_controler_info_t *status);
 
+/* dT/dt data returned by the controller in response to a DTDT_REQUEST.
+ * All values are in tenths of °C/min (e.g. 15 = 1.5 °C/min). */
+typedef struct {
+    int16_t dTdt_10s;
+    int16_t dTdt_20s;
+    int16_t dTdt_30s;
+    int16_t sliding_max_10s;
+    int16_t sliding_max_20s;
+    int16_t sliding_max_30s;
+} dTdt_data_t;
+
+/* Called from the RX task when a valid DTDT_RESPONSE is received. */
+typedef void (*comm_dTdt_cb_t)(const dTdt_data_t *data);
+
 /* Initialise the RS485 UART, start the RX task, and schedule periodic time polling.
    Sends an immediate TIME_REQUEST on startup. */
 esp_err_t comm_init(comm_time_cb_t on_time_received);
@@ -42,3 +56,10 @@ esp_err_t comm_request_time(void);
 /* Send a STATUS_REQUEST and return immediately.
    The response is delivered asynchronously via the comm_status_cb_t callback. */
 esp_err_t comm_request_status(void);
+
+/* Register a callback for DTDT_RESPONSE messages. */
+void comm_set_dTdt_cb(comm_dTdt_cb_t cb);
+
+/* Send a DTDT_REQUEST and return immediately.
+   The response is delivered asynchronously via the comm_dTdt_cb_t callback. */
+esp_err_t comm_request_dTdt(void);

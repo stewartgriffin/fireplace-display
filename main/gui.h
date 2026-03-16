@@ -22,9 +22,13 @@ void gui_handle_touch(uint16_t x, uint16_t y);
    Signature matches comm_status_cb_t — wire directly via comm_set_status_cb(). */
 void gui_on_controller_info(const combustion_controler_info_t *info);
 
-/* Re-render the last received controller info.
+/* Re-render the last received controller info and dTdt overlay.
    Call after restoring the background image to avoid stale display. */
 void gui_redraw_status(void);
+
+/* Store and render the latest dTdt data onto the right side of the framebuffer.
+   session_max[3] are the per-session peak values tracked by the logic module. */
+void gui_on_dTdt(const dTdt_data_t *data, const int16_t session_max[3]);
 
 /* Full-screen rendering — used by logic module for error/recovery screens. */
 void gui_show_error(const char *l1, const char *l2, const char *l3);

@@ -386,7 +386,8 @@ void app_main(void)
     };
     gui_register_button(&btn_ext);
 
-    comm_set_status_cb(gui_on_controller_info);
+    comm_set_status_cb(logic_on_status);
+    comm_set_dTdt_cb(logic_on_dTdt);
     gui_set_touch_callback(backlight_manager_on_button_press);
     ESP_ERROR_CHECK(touch_init(handle_touch));
     ESP_ERROR_CHECK(backlight_manager_init(set_brightness_void));

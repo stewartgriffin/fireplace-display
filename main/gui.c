@@ -19,18 +19,32 @@ typedef struct {
     uint16_t    *backup; /* saved pixels for restore after animation */
 } button_slot_t;
 
-/* ---------- Status overlay ---------- */
+/* ---------- Overlay (status left + dTdt right) ---------- */
 #define STATUS_FONT_SCALE   2
 #define STATUS_CHAR_W       (8 * STATUS_FONT_SCALE)
 #define STATUS_CHAR_H       (8 * STATUS_FONT_SCALE)
 #define STATUS_LINE_STEP    (STATUS_CHAR_H + 6)   /* 6 px gap between lines */
 #define STATUS_LINES        5
-#define STATUS_BLOCK_H      (STATUS_LINES * STATUS_CHAR_H + (STATUS_LINES - 1) * 6)
+#define DTDT_LINES          9
+/* Background must cover the taller of the two blocks */
+#define OVERLAY_LINES       DTDT_LINES
+#define OVERLAY_BLOCK_H     (OVERLAY_LINES * STATUS_CHAR_H + (OVERLAY_LINES - 1) * 6)
 
-/* Bottom of the status block is 40 px above the screen edge */
+/* Bottom of the overlay is 40 px above the screen edge */
+#define OVERLAY_Y_TOP       (720 - 40 - OVERLAY_BLOCK_H)
+
+/* Status block (5 lines) bottom-aligns with 40 px from screen edge */
+#define STATUS_BLOCK_H      (STATUS_LINES * STATUS_CHAR_H + (STATUS_LINES - 1) * 6)
 #define STATUS_Y_TOP        (720 - 40 - STATUS_BLOCK_H)
 
+#define STATUS_X_LEFT       40
+#define STATUS_X_RIGHT      680   /* right edge of dTdt block */
+/* dTdt block: 8 chars wide (4-char label + space + 3-char value), left-aligned */
+#define DTDT_X_LEFT         (STATUS_X_RIGHT - 8 * STATUS_CHAR_W)
 #define STATUS_COLOR        0x630C  /* grey ~(96,96,96) */
+
+/* UTF-8 Δ is not in the ASCII font; we repurpose 0x7F (DEL, unused) as Δ */
+#define DELTA               "\x7f"
 
 static uint16_t     *fb     = NULL;
 static uint16_t      fb_w   = 0;
@@ -41,7 +55,10 @@ static gui_action_t  touch_cb  = NULL;
 
 static combustion_controler_info_t last_info;
 static bool                        has_info = false;
-static uint16_t                   *status_bg = NULL; /* saved fireplace bg under status block */
+static dTdt_data_t                 last_dTdt;
+static bool                        has_dTdt = false;
+static int16_t                     cached_session_max[3];
+static uint16_t                   *overlay_bg = NULL; /* saved fireplace bg under overlay block */
 
 /* forward declaration — defined below with the other blit helpers */
 static void msync_aligned(void *ptr, size_t size);
@@ -69,8 +86,6 @@ static void draw_char_status(uint16_t cx, uint16_t cy, char c, uint16_t color)
     }
 }
 
-#define STATUS_X_LEFT   40
-
 static void draw_status_line(const char *text, uint16_t cy)
 {
     size_t len = strlen(text);
@@ -79,7 +94,15 @@ static void draw_status_line(const char *text, uint16_t cy)
     msync_aligned(fb + cy * fb_w, (size_t)fb_w * STATUS_CHAR_H * sizeof(uint16_t));
 }
 
-/* Format a raw int16 (°C × 10) as "[-]INT.FRAC" into buf. */
+static void draw_dTdt_line(const char *text, uint16_t cy)
+{
+    size_t len = strlen(text);
+    for (size_t i = 0; i < len; i++)
+        draw_char_status((uint16_t)(DTDT_X_LEFT + i * STATUS_CHAR_W), cy, text[i], STATUS_COLOR);
+    msync_aligned(fb + cy * fb_w, (size_t)fb_w * STATUS_CHAR_H * sizeof(uint16_t));
+}
+
+/* Format a raw int16 (°C × 10) as "[-]INT.FRAC C" into buf. */
 static void fmt_temp(char *buf, size_t buf_len, int16_t raw)
 {
     int t = (int)raw;
@@ -92,18 +115,21 @@ static void fmt_temp(char *buf, size_t buf_len, int16_t raw)
         snprintf(buf, buf_len, "%d.%d C", i, f);
 }
 
-static void render_status(void)
+
+static void render_overlay(void)
 {
     if (!fb) return;
 
     /* Restore fireplace background to erase any previous text */
-    if (status_bg) {
-        memcpy(fb + STATUS_Y_TOP * fb_w, status_bg,
-               (size_t)fb_w * STATUS_BLOCK_H * sizeof(uint16_t));
+    if (overlay_bg) {
+        memcpy(fb + OVERLAY_Y_TOP * fb_w, overlay_bg,
+               (size_t)fb_w * OVERLAY_BLOCK_H * sizeof(uint16_t));
     }
 
     char line[32];
-    char tmp[16];
+    char tmp[16];   /* used by fmt_temp for status block */
+
+    /* ---- Left: status block (5 lines) — bottom-aligned to 40 px from screen edge ---- */
     uint16_t y = STATUS_Y_TOP;
 
     if (has_info) fmt_temp(tmp, sizeof(tmp), last_info.ext_temp);
@@ -140,19 +166,79 @@ static void render_status(void)
         snprintf(line, sizeof(line), "Stan: -");
     }
     draw_status_line(line, y);
+
+    /* ---- Right: dTdt block (9 lines, right-justified) ---- */
+    y = OVERLAY_Y_TOP;
+
+    /* dT/dt rows: Δ10, Δ20, Δ30 — space-padded to 4-char label so all rows align */
+    if (has_dTdt) snprintf(line, sizeof(line), " " DELTA "10 %3d", (int)last_dTdt.dTdt_10s);
+    else          snprintf(line, sizeof(line), " " DELTA "10   -");
+    draw_dTdt_line(line, y);
+    y += STATUS_LINE_STEP;
+
+    if (has_dTdt) snprintf(line, sizeof(line), " " DELTA "20 %3d", (int)last_dTdt.dTdt_20s);
+    else          snprintf(line, sizeof(line), " " DELTA "20   -");
+    draw_dTdt_line(line, y);
+    y += STATUS_LINE_STEP;
+
+    if (has_dTdt) snprintf(line, sizeof(line), " " DELTA "30 %3d", (int)last_dTdt.dTdt_30s);
+    else          snprintf(line, sizeof(line), " " DELTA "30   -");
+    draw_dTdt_line(line, y);
+    y += STATUS_LINE_STEP;
+
+    /* Sliding max rows: SΔ10, SΔ20, SΔ30 */
+    if (has_dTdt) snprintf(line, sizeof(line), "S" DELTA "10 %3d", (int)last_dTdt.sliding_max_10s);
+    else          snprintf(line, sizeof(line), "S" DELTA "10   -");
+    draw_dTdt_line(line, y);
+    y += STATUS_LINE_STEP;
+
+    if (has_dTdt) snprintf(line, sizeof(line), "S" DELTA "20 %3d", (int)last_dTdt.sliding_max_20s);
+    else          snprintf(line, sizeof(line), "S" DELTA "20   -");
+    draw_dTdt_line(line, y);
+    y += STATUS_LINE_STEP;
+
+    if (has_dTdt) snprintf(line, sizeof(line), "S" DELTA "30 %3d", (int)last_dTdt.sliding_max_30s);
+    else          snprintf(line, sizeof(line), "S" DELTA "30   -");
+    draw_dTdt_line(line, y);
+    y += STATUS_LINE_STEP;
+
+    /* Session max rows: MΔ10, MΔ20, MΔ30 */
+    if (has_dTdt) snprintf(line, sizeof(line), "M" DELTA "10 %3d", (int)cached_session_max[0]);
+    else          snprintf(line, sizeof(line), "M" DELTA "10   -");
+    draw_dTdt_line(line, y);
+    y += STATUS_LINE_STEP;
+
+    if (has_dTdt) snprintf(line, sizeof(line), "M" DELTA "20 %3d", (int)cached_session_max[1]);
+    else          snprintf(line, sizeof(line), "M" DELTA "20   -");
+    draw_dTdt_line(line, y);
+    y += STATUS_LINE_STEP;
+
+    if (has_dTdt) snprintf(line, sizeof(line), "M" DELTA "30 %3d", (int)cached_session_max[2]);
+    else          snprintf(line, sizeof(line), "M" DELTA "30   -");
+    draw_dTdt_line(line, y);
 }
 
 void gui_on_controller_info(const combustion_controler_info_t *info)
 {
     last_info = *info;
     has_info  = true;
-    render_status();
+    render_overlay();
     ESP_LOGD(TAG, "Controller info updated");
+}
+
+void gui_on_dTdt(const dTdt_data_t *data, const int16_t session_max[3])
+{
+    last_dTdt = *data;
+    has_dTdt  = true;
+    cached_session_max[0] = session_max[0];
+    cached_session_max[1] = session_max[1];
+    cached_session_max[2] = session_max[2];
+    render_overlay();
 }
 
 void gui_redraw_status(void)
 {
-    render_status();
+    render_overlay();
 }
 
 /* ------------------------------------------------------------------ */
@@ -164,15 +250,15 @@ void gui_init(uint16_t *buf, uint16_t w, uint16_t h)
     fb_h  = h;
     btn_count = 0;
 
-    /* Save the fireplace background under the status block so render_status
+    /* Save the fireplace background under the overlay block so render_overlay
        can restore it before each redraw (prevents stale character pixels). */
-    status_bg = malloc((size_t)fb_w * STATUS_BLOCK_H * sizeof(uint16_t));
-    if (status_bg) {
-        memcpy(status_bg, fb + STATUS_Y_TOP * fb_w,
-               (size_t)fb_w * STATUS_BLOCK_H * sizeof(uint16_t));
+    overlay_bg = malloc((size_t)fb_w * OVERLAY_BLOCK_H * sizeof(uint16_t));
+    if (overlay_bg) {
+        memcpy(overlay_bg, fb + OVERLAY_Y_TOP * fb_w,
+               (size_t)fb_w * OVERLAY_BLOCK_H * sizeof(uint16_t));
     }
 
-    render_status();  /* draw "-" placeholders until first STATUS_RESPONSE */
+    render_overlay();  /* draw "-" placeholders until first responses */
 }
 
 void gui_register_button(const gui_button_t *btn)

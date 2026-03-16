@@ -15,11 +15,17 @@ static const char *TAG = "logic";
 #define POLL_PERIOD_US          (60LL * 1000000LL)
 /* 5-second status poll period */
 #define STATUS_POLL_PERIOD_US   (5LL * 1000000LL)
+/* 1-second dTdt poll period */
+#define DTDT_POLL_PERIOD_US     (1LL * 1000000LL)
 
 static SemaphoreHandle_t  mutex;
 static esp_timer_handle_t status_timer = NULL;
 static bool               sync_pending = false;
 static bool               error_shown  = false;
+
+/* Session dTdt maxes — reset when combustion_state transitions to 0 */
+static int16_t  session_max[3];          /* [0]=10s [1]=20s [2]=30s */
+static uint8_t  prev_combustion_state = 0xFF; /* sentinel: unset */
 
 static const uint8_t *fireplace_data = NULL;
 static size_t         fireplace_size = 0;
@@ -46,17 +52,14 @@ static void poll_timer_cb(void *arg)
     ESP_LOGD(TAG, "Time poll sent");
 }
 
+static void dTdt_poll_cb(void *arg)
+{
+    comm_request_dTdt();
+}
+
 static void status_poll_cb(void *arg)
 {
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    bool pending = sync_pending;
-    xSemaphoreGive(mutex);
-
-    /* Skip status poll when a time sync is in flight — on a half-duplex RS485
-     * bus the controller may drop the time request if hit with two frames at
-     * once, and since the poll and status timers share a 60 s common period
-     * they fire simultaneously every minute. */
-    if (!pending && backlight_manager_is_on()) {
+    if (backlight_manager_is_on()) {
         comm_request_status();
     }
 }
@@ -89,7 +92,15 @@ esp_err_t logic_init(const uint8_t *fireplace_img, size_t fireplace_sz)
     ESP_RETURN_ON_ERROR(esp_timer_create(&status_args, &status_timer), TAG, "status timer create failed");
     ESP_RETURN_ON_ERROR(esp_timer_start_periodic(status_timer, STATUS_POLL_PERIOD_US), TAG, "status timer start failed");
 
-    ESP_LOGI(TAG, "Started — time poll every 60 s, status poll every 5 s (when backlight on)");
+    esp_timer_handle_t dTdt_timer;
+    const esp_timer_create_args_t dTdt_args = {
+        .callback = dTdt_poll_cb,
+        .name     = "logic_dTdt",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&dTdt_args, &dTdt_timer), TAG, "dTdt timer create failed");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(dTdt_timer, DTDT_POLL_PERIOD_US), TAG, "dTdt timer start failed");
+
+    ESP_LOGI(TAG, "Started — time poll every 60 s, status poll every 5 s, dTdt poll every 1 s");
     return ESP_OK;
 }
 
@@ -105,6 +116,26 @@ void logic_on_time_synced(void)
         gui_show_fireplace(fireplace_data, fireplace_size);
         gui_redraw_status();
     }
+}
+
+void logic_on_status(const combustion_controler_info_t *info)
+{
+    if (prev_combustion_state != 0xFF && prev_combustion_state != 0 && info->combustion_state == 0) {
+        session_max[0] = 0;
+        session_max[1] = 0;
+        session_max[2] = 0;
+        ESP_LOGI(TAG, "Combustion off — session dTdt maxes reset");
+    }
+    prev_combustion_state = info->combustion_state;
+    gui_on_controller_info(info);
+}
+
+void logic_on_dTdt(const dTdt_data_t *data)
+{
+    if (data->sliding_max_10s > session_max[0]) session_max[0] = data->sliding_max_10s;
+    if (data->sliding_max_20s > session_max[1]) session_max[1] = data->sliding_max_20s;
+    if (data->sliding_max_30s > session_max[2]) session_max[2] = data->sliding_max_30s;
+    gui_on_dTdt(data, session_max);
 }
 
 bool logic_on_touch(void)

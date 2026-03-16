@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "esp_err.h"
+#include "comm.h"
 
 /**
  * Initialise the logic module.
@@ -33,3 +34,11 @@ void logic_on_time_synced(void);
  * @return false Touch passes through normally — call gui_handle_touch.
  */
 bool logic_on_touch(void);
+
+/* Status callback — intercepts combustion_state to reset session dTdt maxes,
+   then forwards to gui_on_controller_info. Wire to comm_set_status_cb(). */
+void logic_on_status(const combustion_controler_info_t *info);
+
+/* dTdt callback — updates session maxes and forwards to gui.
+   Wire to comm_set_dTdt_cb(). */
+void logic_on_dTdt(const dTdt_data_t *data);
